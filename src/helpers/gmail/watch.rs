@@ -990,4 +990,92 @@ mod tests {
         assert_eq!(requests[3].1, "authorization: Bearer pubsub-token");
         assert_eq!(last_history_id, 2);
     }
+
+    /// Spawns a mock server that returns empty pull responses indefinitely.
+    /// Used by the SIGTERM test so the loop blocks in the sleep select!.
+    async fn spawn_empty_pull_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let body = r#"{"receivedMessages":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_watch_pull_loop_exits_on_sigterm() {
+        use std::time::Duration;
+
+        let client = reqwest::Client::new();
+        // Supply enough tokens for several pull iterations
+        let pubsub_provider = FakeTokenProvider::new(["tok"; 16]);
+        let gmail_provider = FakeTokenProvider::new(["tok"; 16]);
+        let (base, server) = spawn_empty_pull_server().await;
+        let sanitize_config = crate::helpers::modelarmor::SanitizeConfig {
+            template: None,
+            mode: crate::helpers::modelarmor::SanitizeMode::Warn,
+        };
+        let runtime = WatchRuntime {
+            client: &client,
+            pubsub_token_provider: &pubsub_provider,
+            gmail_token_provider: &gmail_provider,
+            sanitize_config: &sanitize_config,
+            pubsub_api_base: &base,
+            gmail_api_base: &base,
+        };
+        let mut last_history_id = 0u64;
+        let config = WatchConfig {
+            project: None,
+            subscription: None,
+            topic: None,
+            label_ids: None,
+            max_messages: 1,
+            poll_interval: 60, // Long sleep so SIGTERM fires during the sleep select!
+            format: "full".to_string(),
+            once: false,
+            cleanup: false,
+            output_dir: None,
+        };
+
+        // Send SIGTERM after the first pull completes and the loop enters the sleep select!
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            unsafe { libc::raise(libc::SIGTERM) };
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            watch_pull_loop(
+                &runtime,
+                "projects/test/subscriptions/demo",
+                &mut last_history_id,
+                config,
+            ),
+        )
+        .await;
+
+        server.abort();
+        assert!(
+            result.is_ok(),
+            "loop should exit on SIGTERM within 2 seconds"
+        );
+        assert!(result.unwrap().is_ok(), "loop should return Ok(())");
+    }
 }

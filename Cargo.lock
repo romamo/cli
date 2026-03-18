@@ -914,6 +914,7 @@ dependencies = [
  "hostname",
  "iana-time-zone",
  "keyring",
+ "libc",
  "mail-builder",
  "mime_guess2",
  "percent-encoding",

@@ -84,4 +84,5 @@ inherits = "release"
 lto = "thin"
 
 [dev-dependencies]
+libc = "0.2"
 serial_test = "3.4.0"
