@@ -943,10 +943,7 @@ mod tests {
         .await;
 
         server.abort();
-        assert!(
-            result.is_ok(),
-            "loop should exit on SIGTERM within 2 seconds"
-        );
-        assert!(result.unwrap().is_ok(), "loop should return Ok(())");
+        let inner = result.expect("loop should exit on SIGTERM within 2 seconds");
+        assert!(inner.is_ok(), "loop should return Ok(())");
     }
 }
