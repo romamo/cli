@@ -40,9 +40,10 @@ pub(crate) const PUBSUB_API_BASE: &str = "https://pubsub.googleapis.com/v1";
 /// (`gmail::watch`, `events::subscribe`) to exit cleanly under container
 /// orchestrators (Kubernetes, Docker, systemd) that send SIGTERM.
 ///
-/// The signal handler is registered once in a background task on first call
+/// The signal handler is registered once in a background thread on first call
 /// so it remains active for the lifetime of the process — no gap between
-/// loop iterations.
+/// loop iterations, and it survives across tokio runtime boundaries (e.g.
+/// in tests where each test gets its own runtime).
 pub(crate) async fn shutdown_signal() {
     use std::sync::OnceLock;
     use tokio::sync::Notify;
@@ -52,37 +53,45 @@ pub(crate) async fn shutdown_signal() {
     let notify = NOTIFY.get_or_init(|| {
         let n = std::sync::Arc::new(Notify::new());
         let n2 = n.clone();
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                match signal(SignalKind::terminate()) {
-                    Ok(mut sigterm) => {
-                        tokio::select! {
-                            res = tokio::signal::ctrl_c() => {
-                                res.expect("failed to listen for SIGINT");
+        // Spawn an OS thread with its own single-threaded runtime so the
+        // handler outlives any individual tokio runtime (important in tests).
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build shutdown-signal runtime");
+            rt.block_on(async move {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    match signal(SignalKind::terminate()) {
+                        Ok(mut sigterm) => {
+                            tokio::select! {
+                                res = tokio::signal::ctrl_c() => {
+                                    res.expect("failed to listen for SIGINT");
+                                }
+                                Some(_) = sigterm.recv() => {}
                             }
-                            Some(_) = sigterm.recv() => {}
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: could not register SIGTERM handler: {e}. \
+                                 Listening for Ctrl+C only."
+                            );
+                            tokio::signal::ctrl_c()
+                                .await
+                                .expect("failed to listen for SIGINT");
                         }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "warning: could not register SIGTERM handler: {e}. \
-                             Listening for Ctrl+C only."
-                        );
-                        tokio::signal::ctrl_c()
-                            .await
-                            .expect("failed to listen for SIGINT");
-                    }
                 }
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("failed to listen for SIGINT");
-            }
-            n2.notify_waiters();
+                #[cfg(not(unix))]
+                {
+                    tokio::signal::ctrl_c()
+                        .await
+                        .expect("failed to listen for SIGINT");
+                }
+                n2.notify_waiters();
+            });
         });
         n
     });
